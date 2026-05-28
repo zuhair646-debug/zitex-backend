@@ -235,12 +235,8 @@ async def update_cart_item(item_id: str, quantity: int, user=Depends(get_current
 # ─── Competitions ───
 @api_router.get("/competitions")
 async def get_competitions():
-    # Only show approved competitions (or those that don't require approval) to public
-    query = {"$or": [
-        {"requires_approval": {"$ne": True}},
-        {"approval_status": "approved"}
-    ]}
-    comps = await db.competitions.find(query).sort("created_at", -1).to_list(20)
+    # Show all open competitions (approval workflow removed - merchant decides directly)
+    comps = await db.competitions.find({"status": "open"}).sort("created_at", -1).to_list(50)
     return [serialize_doc(c) for c in comps]
 
 @api_router.get("/competitions/{comp_id}")
@@ -1029,48 +1025,45 @@ async def merchant_list_customers(user=Depends(get_current_user)):
         result.append(c)
     return result
 
-# ─── Merchant: Competitions CRUD with approval workflow ───
+# ─── Merchant: Competitions CRUD (NEW: types + permit + assigned employee) ───
 class CompetitionInput(BaseModel):
     title: str
     description: str = ""
     prize: str
     prize_count: int = 1
-    type: str = "spend_win"
-    spend_requirement: float = 100
+    # NEW: "qa" | "purchase" | "signup" | "general"
+    competition_type: str = "general"
+    question: str = ""
+    correct_answer: str = ""
+    required_product_id: str = ""
+    spend_requirement: float = 0
     start_date: str = ""
     end_date: str = ""
     draw_date: str = ""
     max_participants: int = 1000
-    questions: List[dict] = []
-    requires_approval: bool = True  # merchant choice: chamber approval required?
+    # Chamber supervision (NO approval needed - just permit + assigned employee)
+    chamber_supervised: bool = False
+    permit_number: str = ""
+    assigned_chamber_employee_id: str = ""
+    cover_image: str = ""
 
 @api_router.post("/merchant/competitions")
 async def merchant_create_competition(data: CompetitionInput, user=Depends(get_current_user)):
     require_merchant(user)
     doc = data.model_dump()
     doc.update({
-        "status": "coming_soon" if data.requires_approval else "open",
-        "approval_status": "pending" if data.requires_approval else "auto_approved",
-        "approval_note": "",
-        "approved_by": "",
-        "approved_at": "",
-        "joined_count": 0, "winners": [], "draw_history": [],
+        "status": "open",
+        "joined_count": 0, "winners": [], "draw_history": [], "draw_video_url": "",
         "created_by_merchant": user["id"],
         "created_at": datetime.now(timezone.utc).isoformat()
     })
     r = await db.competitions.insert_one(doc)
-    return {"id": str(r.inserted_id), "message": "Competition submitted" + (" for chamber approval" if data.requires_approval else "")}
+    return {"id": str(r.inserted_id), "message": "Competition published"}
 
 @api_router.put("/merchant/competitions/{cid}")
 async def merchant_update_competition(cid: str, data: CompetitionInput, user=Depends(get_current_user)):
     require_merchant(user)
-    update_doc = data.model_dump()
-    # If requires_approval changes from True → False, auto_approve
-    if not data.requires_approval:
-        update_doc["approval_status"] = "auto_approved"
-    else:
-        update_doc["approval_status"] = "pending"  # re-submit for approval if edited
-    await db.competitions.update_one({"_id": ObjectId(cid)}, {"$set": update_doc})
+    await db.competitions.update_one({"_id": ObjectId(cid)}, {"$set": data.model_dump()})
     return {"message": "Updated"}
 
 @api_router.delete("/merchant/competitions/{cid}")
@@ -1086,31 +1079,134 @@ async def merchant_list_competitions(user=Depends(get_current_user)):
     comps = await db.competitions.find({}).sort("created_at", -1).to_list(100)
     return [serialize_doc(c) for c in comps]
 
-# ─── Chamber: Approval Queue ───
-@api_router.get("/chamber/competitions/pending")
-async def chamber_pending_competitions(user=Depends(get_current_user)):
-    require_chamber(user)
-    comps = await db.competitions.find({"approval_status": "pending"}).sort("created_at", -1).to_list(50)
-    return [serialize_doc(c) for c in comps]
+# ─── Merchant: Chamber employees list (for assigning supervisor) ───
+@api_router.get("/merchant/chamber-employees")
+async def merchant_list_chamber_employees(user=Depends(get_current_user)):
+    require_merchant(user)
+    emps = await db.users.find({"role": "chamber"}).to_list(50)
+    result = []
+    for e in emps:
+        e["id"] = str(e.pop("_id"))
+        e.pop("password_hash", None)
+        result.append({"id": e["id"], "name": e.get("name", ""), "phone": e.get("phone", ""), "email": e.get("email", "")})
+    return result
 
-class ApprovalInput(BaseModel):
-    decision: str  # "approve" or "reject"
-    note: str = ""
+class ChamberEmployeeInput(BaseModel):
+    name: str
+    phone: str
+    password: str
+    email: str = ""
 
-@api_router.post("/chamber/competitions/{cid}/decision")
-async def chamber_approve_competition(cid: str, data: ApprovalInput, user=Depends(get_current_user)):
-    require_chamber(user)
-    new_status = "approved" if data.decision == "approve" else "rejected"
-    update_doc = {
-        "approval_status": new_status,
-        "approval_note": data.note,
-        "approved_by": user.get("name", ""),
-        "approved_at": datetime.now(timezone.utc).isoformat(),
+@api_router.post("/merchant/chamber-employees")
+async def merchant_create_chamber_employee(data: ChamberEmployeeInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    if await db.users.count_documents({"phone": data.phone}) > 0:
+        raise HTTPException(status_code=400, detail="Phone already registered")
+    doc = {
+        "phone": data.phone, "password_hash": hash_password(data.password),
+        "name": data.name, "email": data.email, "city": "", "gender": "", "role": "chamber",
+        "points": 0, "wallet_balance": 0,
+        "created_at": datetime.now(timezone.utc).isoformat()
     }
-    if data.decision == "approve":
-        update_doc["status"] = "open"  # make it visible/active
-    await db.competitions.update_one({"_id": ObjectId(cid)}, {"$set": update_doc})
-    return {"message": f"Competition {new_status}"}
+    r = await db.users.insert_one(doc)
+    return {"id": str(r.inserted_id), "message": "Chamber employee created"}
+
+# ─── Q&A Answer Submission ───
+@api_router.post("/competitions/{cid}/answer")
+async def submit_answer(cid: str, request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    answer = (body.get("answer") or "").strip().lower()
+    comp = await db.competitions.find_one({"_id": ObjectId(cid)})
+    if not comp:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    if comp.get("competition_type") != "qa":
+        raise HTTPException(status_code=400, detail="Not a Q&A competition")
+    correct = (comp.get("correct_answer") or "").strip().lower()
+    is_correct = answer == correct
+    if is_correct:
+        existing = await db.competition_entries.find_one({"competition_id": cid, "user_id": user["id"]})
+        if not existing:
+            await db.competition_entries.insert_one({
+                "competition_id": cid, "user_id": user["id"], "user_name": user.get("name", ""),
+                "user_phone": user.get("phone", ""), "entry_type": "qa_answer",
+                "answer": answer, "created_at": datetime.now(timezone.utc).isoformat()
+            })
+            await db.competitions.update_one({"_id": ObjectId(cid)}, {"$inc": {"joined_count": 1}})
+    return {"correct": is_correct, "entered": is_correct}
+
+@api_router.post("/competitions/{cid}/join")
+async def join_competition(cid: str, user=Depends(get_current_user)):
+    comp = await db.competitions.find_one({"_id": ObjectId(cid)})
+    if not comp:
+        raise HTTPException(status_code=404, detail="Not found")
+    if comp.get("competition_type") not in ["signup", "general"]:
+        raise HTTPException(status_code=400, detail="Not joinable directly")
+    existing = await db.competition_entries.find_one({"competition_id": cid, "user_id": user["id"]})
+    if existing:
+        return {"message": "Already joined"}
+    await db.competition_entries.insert_one({
+        "competition_id": cid, "user_id": user["id"], "user_name": user.get("name", ""),
+        "user_phone": user.get("phone", ""), "entry_type": "direct",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    await db.competitions.update_one({"_id": ObjectId(cid)}, {"$inc": {"joined_count": 1}})
+    return {"message": "Joined"}
+
+@api_router.post("/competitions/{cid}/draw-video")
+async def save_draw_video(cid: str, request: Request, user=Depends(get_current_user)):
+    if user.get("role") not in ["chamber", "merchant"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    body = await request.json()
+    video_url = body.get("video_url", "")
+    if not video_url:
+        raise HTTPException(status_code=400, detail="video_url required")
+    await db.competitions.update_one({"_id": ObjectId(cid)}, {"$set": {"draw_video_url": video_url}})
+    return {"message": "Video saved"}
+
+# ─── Social: Reply to comment ───
+@api_router.post("/social/posts/{post_id}/comments/{comment_id}/reply")
+async def reply_to_comment(post_id: str, comment_id: str, request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    await db.social_comments.insert_one({
+        "post_id": post_id,
+        "parent_comment_id": comment_id,
+        "user_id": user["id"],
+        "user_name": user.get("name", ""),
+        "is_merchant": user.get("role") == "merchant",
+        "text": body.get("text", ""),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    await db.social_posts.update_one({"_id": ObjectId(post_id)}, {"$inc": {"comments": 1}})
+    return {"message": "Reply added"}
+
+# ─── Cloudinary Setup ───
+import cloudinary
+import cloudinary.uploader
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", "dyujjjvb2"),
+    api_key=os.getenv("CLOUDINARY_API_KEY", "481658855999211"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET", "PcLD2c2kSvdDvefY36aeKX3tfac"),
+    secure=True,
+)
+
+@api_router.post("/upload/signature")
+async def get_upload_signature(request: Request, user=Depends(get_current_user)):
+    """Generate signed upload params for direct client → Cloudinary upload."""
+    body = await request.json()
+    folder = body.get("folder", "zitex/general")
+    resource_type = body.get("resource_type", "auto")
+    import time
+    timestamp = int(time.time())
+    params_to_sign = {"timestamp": timestamp, "folder": folder}
+    signature = cloudinary.utils.api_sign_request(params_to_sign, cloudinary.config().api_secret)
+    return {
+        "signature": signature,
+        "timestamp": timestamp,
+        "api_key": cloudinary.config().api_key,
+        "cloud_name": cloudinary.config().cloud_name,
+        "folder": folder,
+        "resource_type": resource_type,
+    }
 
 async def seed_data():
     # Categories
