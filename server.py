@@ -1286,7 +1286,25 @@ async def update_delivery_settings(request: Request, user=Depends(get_current_us
 async def calculate_delivery_fee(request: Request):
     body = await request.json()
     distance_km = body.get("distance_km", 0)
+    customer_lat = body.get("lat", 0)
+    customer_lng = body.get("lng", 0)
+    delivery_type = body.get("delivery_type", "standard")  # "same_day" | "standard"
     s = await db.settings.find_one({"key": "delivery"}) or {}
+    # Check if customer point falls in any zone (highest-priority zone applies)
+    zones = s.get("zones", [])
+    for z in zones:
+        if z.get("delivery_type") and z.get("delivery_type") != delivery_type:
+            continue
+        if customer_lat and customer_lng and z.get("center_lat"):
+            d = haversine_km(customer_lat, customer_lng, z.get("center_lat", 0), z.get("center_lng", 0))
+            if d <= z.get("radius_km", 0):
+                return {"distance_km": round(d, 2), "delivery_fee": z.get("fixed_price", 0),
+                        "zone_name": z.get("name", ""), "delivery_type": delivery_type, "in_zone": True}
+    # Same-day flat rate if no zone match
+    if delivery_type == "same_day":
+        fee = s.get("same_day_flat_price", 30)
+        return {"distance_km": distance_km, "delivery_fee": fee, "delivery_type": "same_day", "in_zone": False}
+    # Standard: distance-based
     base_fee = s.get("base_fee", 10)
     base_dist = s.get("base_distance_km", 10)
     per_km = s.get("per_km_rate", 1.2)
@@ -1294,7 +1312,9 @@ async def calculate_delivery_fee(request: Request):
         fee = base_fee
     else:
         fee = base_fee + (distance_km - base_dist) * per_km
-    return {"distance_km": distance_km, "delivery_fee": round(fee, 2), "base_fee": base_fee, "base_distance_km": base_dist, "per_km_rate": per_km}
+    return {"distance_km": distance_km, "delivery_fee": round(fee, 2),
+            "base_fee": base_fee, "base_distance_km": base_dist, "per_km_rate": per_km,
+            "delivery_type": "standard", "in_zone": False}
 
 # ─── Drivers CRUD (merchant) ───
 class DriverInput(BaseModel):
