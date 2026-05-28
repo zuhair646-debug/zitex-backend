@@ -235,7 +235,12 @@ async def update_cart_item(item_id: str, quantity: int, user=Depends(get_current
 # ─── Competitions ───
 @api_router.get("/competitions")
 async def get_competitions():
-    comps = await db.competitions.find({}).sort("created_at", -1).to_list(20)
+    # Only show approved competitions (or those that don't require approval) to public
+    query = {"$or": [
+        {"requires_approval": {"$ne": True}},
+        {"approval_status": "approved"}
+    ]}
+    comps = await db.competitions.find(query).sort("created_at", -1).to_list(20)
     return [serialize_doc(c) for c in comps]
 
 @api_router.get("/competitions/{comp_id}")
@@ -757,6 +762,356 @@ async def bookmark_post(post_id: str, user=Depends(get_current_user)):
     await db.social_bookmarks.insert_one({"post_id": post_id, "user_id": user["id"]})
     return {"bookmarked": True}
 
+# ═══════════════════════════════════════════════════
+# MERCHANT / ADMIN PANEL  (role = "merchant")
+# ═══════════════════════════════════════════════════
+def require_merchant(user):
+    if user.get("role") != "merchant":
+        raise HTTPException(status_code=403, detail="Merchant access only")
+
+def require_chamber(user):
+    if user.get("role") != "chamber":
+        raise HTTPException(status_code=403, detail="Chamber access only")
+
+# ─── Merchant: Dashboard Stats ───
+@api_router.get("/merchant/stats")
+async def merchant_stats(user=Depends(get_current_user)):
+    require_merchant(user)
+    today = datetime.now(timezone.utc).date().isoformat()
+    total_orders = await db.orders.count_documents({})
+    pending_orders = await db.orders.count_documents({"status": {"$in": ["pending", "processing"]}})
+    total_products = await db.products.count_documents({})
+    total_customers = await db.users.count_documents({"role": "user"})
+    pending_bookings = await db.service_bookings.count_documents({"status": "pending"})
+    pending_competitions = await db.competitions.count_documents({"approval_status": "pending"})
+    rejected_competitions = await db.competitions.count_documents({"approval_status": "rejected"})
+    # Revenue calc
+    orders = await db.orders.find({"status": {"$nin": ["cancelled"]}}).to_list(1000)
+    total_revenue = sum(o.get("total", 0) for o in orders)
+    today_revenue = sum(o.get("total", 0) for o in orders if o.get("created_at", "").startswith(today))
+    return {
+        "total_orders": total_orders,
+        "pending_orders": pending_orders,
+        "total_products": total_products,
+        "total_customers": total_customers,
+        "total_revenue": total_revenue,
+        "today_revenue": today_revenue,
+        "pending_bookings": pending_bookings,
+        "pending_competitions_approval": pending_competitions,
+        "rejected_competitions": rejected_competitions,
+    }
+
+# ─── Merchant: Products CRUD ───
+class ProductInput(BaseModel):
+    name_ar: str
+    name_en: str = ""
+    description_ar: str = ""
+    description_en: str = ""
+    category_id: str = ""
+    brand_id: str = ""
+    price: float
+    discount_price: Optional[float] = None
+    condition: str = "new"
+    images: List[str] = []
+    storage_options: List[str] = []
+    colors: List[dict] = []
+    specs: dict = {}
+    in_stock: bool = True
+    featured: bool = False
+    published: bool = True
+
+@api_router.post("/merchant/products")
+async def merchant_create_product(data: ProductInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    doc = data.model_dump()
+    doc.update({"rating": 0, "review_count": 0, "sold_count": 0,
+                "created_at": datetime.now(timezone.utc).isoformat()})
+    r = await db.products.insert_one(doc)
+    return {"id": str(r.inserted_id), "message": "Product created"}
+
+@api_router.put("/merchant/products/{pid}")
+async def merchant_update_product(pid: str, data: ProductInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.products.update_one({"_id": ObjectId(pid)}, {"$set": data.model_dump()})
+    return {"message": "Product updated"}
+
+@api_router.delete("/merchant/products/{pid}")
+async def merchant_delete_product(pid: str, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.products.delete_one({"_id": ObjectId(pid)})
+    return {"message": "Product deleted"}
+
+@api_router.get("/merchant/products")
+async def merchant_list_products(user=Depends(get_current_user)):
+    require_merchant(user)
+    products = await db.products.find({}).sort("created_at", -1).to_list(500)
+    return [serialize_doc(p) for p in products]
+
+# ─── Merchant: Categories CRUD ───
+class CategoryInput(BaseModel):
+    name_ar: str
+    name_en: str = ""
+    image: str = "📦"
+    color1: str = "#8833FF"
+    color2: str = "#AA66FF"
+    published: bool = True
+    order: int = 100
+
+@api_router.post("/merchant/categories")
+async def merchant_create_category(data: CategoryInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    r = await db.categories.insert_one(data.model_dump())
+    return {"id": str(r.inserted_id), "message": "Category created"}
+
+@api_router.put("/merchant/categories/{cid}")
+async def merchant_update_category(cid: str, data: CategoryInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.categories.update_one({"_id": ObjectId(cid)}, {"$set": data.model_dump()})
+    return {"message": "Updated"}
+
+@api_router.delete("/merchant/categories/{cid}")
+async def merchant_delete_category(cid: str, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.categories.delete_one({"_id": ObjectId(cid)})
+    return {"message": "Deleted"}
+
+# ─── Merchant: Banners CRUD ───
+class BannerInput(BaseModel):
+    image: str
+    title_ar: str = ""
+    title_en: str = ""
+    type: str = "normal"
+    published: bool = True
+    order: int = 100
+
+@api_router.post("/merchant/banners")
+async def merchant_create_banner(data: BannerInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    r = await db.banners.insert_one(data.model_dump())
+    return {"id": str(r.inserted_id), "message": "Banner created"}
+
+@api_router.put("/merchant/banners/{bid}")
+async def merchant_update_banner(bid: str, data: BannerInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.banners.update_one({"_id": ObjectId(bid)}, {"$set": data.model_dump()})
+    return {"message": "Updated"}
+
+@api_router.delete("/merchant/banners/{bid}")
+async def merchant_delete_banner(bid: str, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.banners.delete_one({"_id": ObjectId(bid)})
+    return {"message": "Deleted"}
+
+# ─── Merchant: Services CRUD ───
+class ServiceInput(BaseModel):
+    name: str
+    desc: str = ""
+    icon: str = "construct"
+    color: str = "#8833FF"
+    price: float
+    inspection_price: float = 0
+    turnaround: str = "1-2 Days"
+    delivery_available: bool = True
+    home_pickup: bool = True
+    warranty_available: bool = True
+    warranty_days: int = 90
+    published: bool = True
+
+@api_router.post("/merchant/services")
+async def merchant_create_service(data: ServiceInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    doc = data.model_dump()
+    doc.update({"total_requests": 0, "rating": 0, "review_count": 0})
+    r = await db.services.insert_one(doc)
+    return {"id": str(r.inserted_id), "message": "Service created"}
+
+@api_router.put("/merchant/services/{sid}")
+async def merchant_update_service(sid: str, data: ServiceInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.services.update_one({"_id": ObjectId(sid)}, {"$set": data.model_dump()})
+    return {"message": "Updated"}
+
+@api_router.delete("/merchant/services/{sid}")
+async def merchant_delete_service(sid: str, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.services.delete_one({"_id": ObjectId(sid)})
+    return {"message": "Deleted"}
+
+# ─── Merchant: Orders Management ───
+@api_router.get("/merchant/orders")
+async def merchant_list_orders(user=Depends(get_current_user)):
+    require_merchant(user)
+    orders = await db.orders.find({}).sort("created_at", -1).to_list(500)
+    result = []
+    for o in orders:
+        o["id"] = str(o.pop("_id"))
+        cust = await db.users.find_one({"_id": ObjectId(o["user_id"])}) if ObjectId.is_valid(o.get("user_id", "")) else None
+        if cust:
+            o["customer_name"] = cust.get("name", "")
+            o["customer_phone"] = cust.get("phone", "")
+        result.append(o)
+    return result
+
+@api_router.put("/merchant/orders/{oid}/status")
+async def merchant_update_order_status(oid: str, request: Request, user=Depends(get_current_user)):
+    require_merchant(user)
+    body = await request.json()
+    new_status = body.get("status", "")
+    if new_status not in ["pending", "processing", "shipped", "delivered", "cancelled"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+    await db.orders.update_one({"_id": ObjectId(oid)}, {"$set": {"status": new_status,
+                                                                   "status_updated_at": datetime.now(timezone.utc).isoformat()}})
+    return {"message": "Status updated"}
+
+# ─── Merchant: Service Bookings Management ───
+@api_router.get("/merchant/bookings")
+async def merchant_list_bookings(user=Depends(get_current_user)):
+    require_merchant(user)
+    bookings = await db.service_bookings.find({}).sort("created_at", -1).to_list(500)
+    result = []
+    for b in bookings:
+        b["id"] = str(b.pop("_id"))
+        cust = await db.users.find_one({"_id": ObjectId(b["user_id"])}) if ObjectId.is_valid(b.get("user_id", "")) else None
+        if cust:
+            b["customer_name"] = cust.get("name", "")
+            b["customer_phone"] = cust.get("phone", "")
+        result.append(b)
+    return result
+
+@api_router.put("/merchant/bookings/{bid}/status")
+async def merchant_update_booking_status(bid: str, request: Request, user=Depends(get_current_user)):
+    require_merchant(user)
+    body = await request.json()
+    await db.service_bookings.update_one({"_id": ObjectId(bid)}, {"$set": {"status": body.get("status", "")}})
+    return {"message": "Updated"}
+
+# ─── Merchant: Social Posts CRUD ───
+class SocialPostInput(BaseModel):
+    text: str
+    image: str = ""
+    type: str = "post"  # post | poll
+    poll_options: List[dict] = []
+
+@api_router.post("/merchant/social/posts")
+async def merchant_create_post(data: SocialPostInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    doc = {
+        "author": user.get("name", "Store"),
+        "author_id": user["id"],
+        "text": data.text, "image": data.image, "type": data.type,
+        "likes": 0, "comments": 0, "views": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if data.type == "poll":
+        doc["poll_options"] = data.poll_options
+    r = await db.social_posts.insert_one(doc)
+    return {"id": str(r.inserted_id), "message": "Post published"}
+
+@api_router.delete("/merchant/social/posts/{pid}")
+async def merchant_delete_post(pid: str, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.social_posts.delete_one({"_id": ObjectId(pid)})
+    await db.social_comments.delete_many({"post_id": pid})
+    await db.social_likes.delete_many({"post_id": pid})
+    return {"message": "Deleted"}
+
+# ─── Merchant: Customers list ───
+@api_router.get("/merchant/customers")
+async def merchant_list_customers(user=Depends(get_current_user)):
+    require_merchant(user)
+    customers = await db.users.find({"role": "user"}).sort("created_at", -1).to_list(500)
+    result = []
+    for c in customers:
+        c["id"] = str(c.pop("_id"))
+        c.pop("password_hash", None)
+        orders_count = await db.orders.count_documents({"user_id": c["id"]})
+        c["orders_count"] = orders_count
+        result.append(c)
+    return result
+
+# ─── Merchant: Competitions CRUD with approval workflow ───
+class CompetitionInput(BaseModel):
+    title: str
+    description: str = ""
+    prize: str
+    prize_count: int = 1
+    type: str = "spend_win"
+    spend_requirement: float = 100
+    start_date: str = ""
+    end_date: str = ""
+    draw_date: str = ""
+    max_participants: int = 1000
+    questions: List[dict] = []
+    requires_approval: bool = True  # merchant choice: chamber approval required?
+
+@api_router.post("/merchant/competitions")
+async def merchant_create_competition(data: CompetitionInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    doc = data.model_dump()
+    doc.update({
+        "status": "coming_soon" if data.requires_approval else "open",
+        "approval_status": "pending" if data.requires_approval else "auto_approved",
+        "approval_note": "",
+        "approved_by": "",
+        "approved_at": "",
+        "joined_count": 0, "winners": [], "draw_history": [],
+        "created_by_merchant": user["id"],
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    r = await db.competitions.insert_one(doc)
+    return {"id": str(r.inserted_id), "message": "Competition submitted" + (" for chamber approval" if data.requires_approval else "")}
+
+@api_router.put("/merchant/competitions/{cid}")
+async def merchant_update_competition(cid: str, data: CompetitionInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    update_doc = data.model_dump()
+    # If requires_approval changes from True → False, auto_approve
+    if not data.requires_approval:
+        update_doc["approval_status"] = "auto_approved"
+    else:
+        update_doc["approval_status"] = "pending"  # re-submit for approval if edited
+    await db.competitions.update_one({"_id": ObjectId(cid)}, {"$set": update_doc})
+    return {"message": "Updated"}
+
+@api_router.delete("/merchant/competitions/{cid}")
+async def merchant_delete_competition(cid: str, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.competitions.delete_one({"_id": ObjectId(cid)})
+    await db.competition_entries.delete_many({"competition_id": cid})
+    return {"message": "Deleted"}
+
+@api_router.get("/merchant/competitions")
+async def merchant_list_competitions(user=Depends(get_current_user)):
+    require_merchant(user)
+    comps = await db.competitions.find({}).sort("created_at", -1).to_list(100)
+    return [serialize_doc(c) for c in comps]
+
+# ─── Chamber: Approval Queue ───
+@api_router.get("/chamber/competitions/pending")
+async def chamber_pending_competitions(user=Depends(get_current_user)):
+    require_chamber(user)
+    comps = await db.competitions.find({"approval_status": "pending"}).sort("created_at", -1).to_list(50)
+    return [serialize_doc(c) for c in comps]
+
+class ApprovalInput(BaseModel):
+    decision: str  # "approve" or "reject"
+    note: str = ""
+
+@api_router.post("/chamber/competitions/{cid}/decision")
+async def chamber_approve_competition(cid: str, data: ApprovalInput, user=Depends(get_current_user)):
+    require_chamber(user)
+    new_status = "approved" if data.decision == "approve" else "rejected"
+    update_doc = {
+        "approval_status": new_status,
+        "approval_note": data.note,
+        "approved_by": user.get("name", ""),
+        "approved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if data.decision == "approve":
+        update_doc["status"] = "open"  # make it visible/active
+    await db.competitions.update_one({"_id": ObjectId(cid)}, {"$set": update_doc})
+    return {"message": f"Competition {new_status}"}
+
 async def seed_data():
     # Categories
     if await db.categories.count_documents({}) == 0:
@@ -908,6 +1263,17 @@ async def seed_data():
             "created_at": datetime.now(timezone.utc).isoformat()
         })
         logger.info("Seeded Chamber of Commerce account")
+
+    # Seed Merchant account (the single store owner)
+    if await db.users.count_documents({"phone": "0509999999"}) == 0:
+        await db.users.insert_one({
+            "phone": "0509999999", "password_hash": hash_password("merchant2025"),
+            "name": "Zitex Store", "email": "owner@zitex.sa",
+            "city": "Riyadh", "gender": "", "role": "merchant",
+            "points": 0, "wallet_balance": 0,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+        logger.info("Seeded Merchant account")
 
     # Seed competitions
     if await db.competitions.count_documents({}) == 0:
