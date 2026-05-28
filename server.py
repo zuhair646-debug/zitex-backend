@@ -1,0 +1,1108 @@
+from dotenv import load_dotenv
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Depends
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
+import os
+import logging
+import bcrypt
+import jwt
+import secrets
+from datetime import datetime, timezone, timedelta
+from pydantic import BaseModel, Field
+from typing import List, Optional
+import re
+
+# MongoDB connection
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ.get('DB_NAME', 'techstore')]
+
+app = FastAPI()
+api_router = APIRouter(prefix="/api")
+
+JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
+JWT_ALGORITHM = "HS256"
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ─── Helpers ───
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+
+def create_access_token(user_id: str) -> str:
+    payload = {"sub": user_id, "exp": datetime.now(timezone.utc) + timedelta(days=7), "type": "access"}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def serialize_doc(doc):
+    if doc is None:
+        return None
+    doc["id"] = str(doc.pop("_id"))
+    return doc
+
+async def get_current_user(request: Request) -> dict:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = auth[7:]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        user["id"] = str(user.pop("_id"))
+        user.pop("password_hash", None)
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ─── Models ───
+class RegisterInput(BaseModel):
+    phone: str
+    password: str
+    name: str
+
+class LoginInput(BaseModel):
+    phone: str
+    password: str
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    city: Optional[str] = None
+    gender: Optional[str] = None
+
+class CartItemInput(BaseModel):
+    product_id: str
+    quantity: int = 1
+    color: Optional[str] = None
+    storage: Optional[str] = None
+
+class OrderInput(BaseModel):
+    address: str
+    phone: str
+    delivery_type: str = "standard"
+    payment_method: str = "cash"
+    notes: Optional[str] = None
+    coupon_code: Optional[str] = None
+
+# ─── Auth Routes ───
+@api_router.post("/auth/register")
+async def register(data: RegisterInput):
+    existing = await db.users.find_one({"phone": data.phone})
+    if existing:
+        raise HTTPException(status_code=400, detail="رقم الهاتف مسجل مسبقاً")
+    user_doc = {
+        "phone": data.phone,
+        "password_hash": hash_password(data.password),
+        "name": data.name,
+        "email": "",
+        "city": "",
+        "gender": "",
+        "role": "user",
+        "points": 0,
+        "wallet_balance": 0,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    result = await db.users.insert_one(user_doc)
+    user_doc["id"] = str(result.inserted_id)
+    user_doc.pop("_id", None)
+    user_doc.pop("password_hash")
+    token = create_access_token(user_doc["id"])
+    return {"user": user_doc, "token": token}
+
+@api_router.post("/auth/login")
+async def login(data: LoginInput):
+    user = await db.users.find_one({"phone": data.phone})
+    if not user or not verify_password(data.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="رقم الهاتف أو كلمة المرور غير صحيحة")
+    user["id"] = str(user.pop("_id"))
+    user.pop("password_hash")
+    token = create_access_token(user["id"])
+    return {"user": user, "token": token}
+
+@api_router.get("/auth/me")
+async def get_me(user=Depends(get_current_user)):
+    return {"user": user}
+
+# ─── Categories ───
+@api_router.get("/categories")
+async def get_categories():
+    cats = await db.categories.find({"published": True}).to_list(100)
+    return [serialize_doc(c) for c in cats]
+
+# ─── Brands ───
+@api_router.get("/brands")
+async def get_brands():
+    brands = await db.brands.find({"published": True}).to_list(100)
+    return [serialize_doc(b) for b in brands]
+
+# ─── Products ───
+@api_router.get("/products")
+async def get_products(category: Optional[str] = None, brand: Optional[str] = None,
+                       search: Optional[str] = None, min_price: Optional[float] = None,
+                       max_price: Optional[float] = None, condition: Optional[str] = None,
+                       sort: Optional[str] = "newest", page: int = 1, limit: int = 20):
+    query = {"published": True}
+    if category:
+        query["category_id"] = category
+    if brand:
+        query["brand_id"] = brand
+    if condition:
+        query["condition"] = condition
+    if search:
+        query["$or"] = [
+            {"name_ar": {"$regex": search, "$options": "i"}},
+            {"name_en": {"$regex": search, "$options": "i"}}
+        ]
+    if min_price is not None or max_price is not None:
+        price_q = {}
+        if min_price is not None:
+            price_q["$gte"] = min_price
+        if max_price is not None:
+            price_q["$lte"] = max_price
+        query["price"] = price_q
+
+    sort_field = {"newest": [("created_at", -1)], "oldest": [("created_at", 1)],
+                  "price_asc": [("price", 1)], "price_desc": [("price", -1)],
+                  "popular": [("sold_count", -1)]}.get(sort, [("created_at", -1)])
+
+    skip = (page - 1) * limit
+    products = await db.products.find(query).sort(sort_field).skip(skip).limit(limit).to_list(limit)
+    total = await db.products.count_documents(query)
+    return {"products": [serialize_doc(p) for p in products], "total": total, "page": page, "pages": (total + limit - 1) // limit}
+
+@api_router.get("/products/featured")
+async def get_featured_products():
+    products = await db.products.find({"published": True, "featured": True}).limit(10).to_list(10)
+    return [serialize_doc(p) for p in products]
+
+@api_router.get("/products/{product_id}")
+async def get_product(product_id: str):
+    product = await db.products.find_one({"_id": ObjectId(product_id)})
+    if not product:
+        raise HTTPException(status_code=404, detail="المنتج غير موجود")
+    return serialize_doc(product)
+
+# ─── Cart ───
+@api_router.get("/cart")
+async def get_cart(user=Depends(get_current_user)):
+    items = await db.cart_items.find({"user_id": user["id"]}).to_list(100)
+    result = []
+    for item in items:
+        product = await db.products.find_one({"_id": ObjectId(item["product_id"])})
+        item_data = serialize_doc(item)
+        if product:
+            item_data["product"] = serialize_doc(product)
+        result.append(item_data)
+    return result
+
+@api_router.post("/cart")
+async def add_to_cart(data: CartItemInput, user=Depends(get_current_user)):
+    existing = await db.cart_items.find_one({
+        "user_id": user["id"], "product_id": data.product_id,
+        "color": data.color, "storage": data.storage
+    })
+    if existing:
+        await db.cart_items.update_one({"_id": existing["_id"]}, {"$inc": {"quantity": data.quantity}})
+    else:
+        await db.cart_items.insert_one({
+            "user_id": user["id"], "product_id": data.product_id,
+            "quantity": data.quantity, "color": data.color, "storage": data.storage,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+    return {"message": "تمت الإضافة إلى السلة"}
+
+@api_router.put("/cart/{item_id}")
+async def update_cart_item(item_id: str, quantity: int, user=Depends(get_current_user)):
+    if quantity <= 0:
+        await db.cart_items.delete_one({"_id": ObjectId(item_id), "user_id": user["id"]})
+    else:
+        await db.cart_items.update_one({"_id": ObjectId(item_id), "user_id": user["id"]}, {"$set": {"quantity": quantity}})
+    return {"message": "Updated"}
+
+# ─── Competitions ───
+@api_router.get("/competitions")
+async def get_competitions():
+    comps = await db.competitions.find({}).sort("created_at", -1).to_list(20)
+    return [serialize_doc(c) for c in comps]
+
+@api_router.get("/competitions/{comp_id}")
+async def get_competition(comp_id: str):
+    comp = await db.competitions.find_one({"_id": ObjectId(comp_id)})
+    if not comp:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    return serialize_doc(comp)
+
+@api_router.post("/competitions/{comp_id}/join")
+async def join_competition(comp_id: str, user=Depends(get_current_user)):
+    comp = await db.competitions.find_one({"_id": ObjectId(comp_id)})
+    if not comp:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    existing = await db.competition_entries.find_one({"competition_id": comp_id, "user_id": user["id"]})
+    if existing:
+        raise HTTPException(status_code=400, detail="Already joined")
+    await db.competition_entries.insert_one({
+        "competition_id": comp_id, "user_id": user["id"], "user_name": user["name"],
+        "user_phone": user["phone"], "joined_at": datetime.now(timezone.utc).isoformat()
+    })
+    await db.competitions.update_one({"_id": ObjectId(comp_id)}, {"$inc": {"joined_count": 1}})
+    return {"message": "Joined successfully"}
+
+@api_router.get("/competitions/{comp_id}/participants")
+async def get_participants(comp_id: str):
+    entries = await db.competition_entries.find({"competition_id": comp_id}).to_list(1000)
+    return [serialize_doc(e) for e in entries]
+
+@api_router.post("/competitions/{comp_id}/draw")
+async def do_draw(comp_id: str):
+    import random
+    comp = await db.competitions.find_one({"_id": ObjectId(comp_id)})
+    if not comp:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    entries = await db.competition_entries.find({"competition_id": comp_id}).to_list(1000)
+    if len(entries) < 1:
+        raise HTTPException(status_code=400, detail="Not enough participants")
+    prize_count = comp.get("prize_count", 1)
+    winners = random.sample(entries, min(prize_count, len(entries)))
+    winner_list = []
+    for w in winners:
+        winner_list.append({"user_id": w["user_id"], "user_name": w["user_name"], "user_phone": w["user_phone"]})
+    draw_record = {
+        "competition_id": comp_id, "draw_number": len(comp.get("draw_history", [])) + 1,
+        "winners": winner_list, "drawn_at": datetime.now(timezone.utc).isoformat(),
+        "drawn_by": "system"
+    }
+    await db.competitions.update_one({"_id": ObjectId(comp_id)}, {
+        "$set": {"winners": winner_list, "status": "ended"},
+        "$push": {"draw_history": draw_record}
+    })
+    return {"winners": winner_list, "draw_number": draw_record["draw_number"]}
+
+# ─── Chamber Draw (with auth tracking) ───
+@api_router.post("/chamber/competitions/{comp_id}/draw")
+async def chamber_draw(comp_id: str, user=Depends(get_current_user)):
+    if user.get("role") != "chamber":
+        raise HTTPException(status_code=403, detail="Chamber access only")
+    import random
+    comp = await db.competitions.find_one({"_id": ObjectId(comp_id)})
+    if not comp:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    entries = await db.competition_entries.find({"competition_id": comp_id}).to_list(1000)
+    if len(entries) < 1:
+        raise HTTPException(status_code=400, detail="Not enough participants")
+    prize_count = comp.get("prize_count", 1)
+    winners = random.sample(entries, min(prize_count, len(entries)))
+    winner_list = []
+    for w in winners:
+        winner_list.append({"user_id": w["user_id"], "user_name": w["user_name"], "user_phone": w["user_phone"]})
+    draw_record = {
+        "competition_id": comp_id, "draw_number": len(comp.get("draw_history", [])) + 1,
+        "winners": winner_list, "drawn_at": datetime.now(timezone.utc).isoformat(),
+        "drawn_by": user["name"], "drawn_by_role": "chamber"
+    }
+    await db.competitions.update_one({"_id": ObjectId(comp_id)}, {
+        "$set": {"winners": winner_list},
+        "$push": {"draw_history": draw_record}
+    })
+    return {"winners": winner_list, "draw_number": draw_record["draw_number"], "drawn_by": user["name"]}
+
+@api_router.get("/chamber/competitions")
+async def chamber_get_competitions(user=Depends(get_current_user)):
+    if user.get("role") != "chamber":
+        raise HTTPException(status_code=403, detail="Chamber access only")
+    comps = await db.competitions.find({}).sort("created_at", -1).to_list(50)
+    result = []
+    for c in comps:
+        c["id"] = str(c.pop("_id"))
+        entries_count = await db.competition_entries.count_documents({"competition_id": c["id"]})
+        c["total_participants"] = entries_count
+        result.append(c)
+    return result
+
+@api_router.get("/chamber/competitions/{comp_id}/full")
+async def chamber_competition_full(comp_id: str, user=Depends(get_current_user)):
+    if user.get("role") != "chamber":
+        raise HTTPException(status_code=403, detail="Chamber access only")
+    comp = await db.competitions.find_one({"_id": ObjectId(comp_id)})
+    if not comp:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    comp["id"] = str(comp.pop("_id"))
+    entries = await db.competition_entries.find({"competition_id": comp_id}).to_list(1000)
+    comp["participants"] = [serialize_doc(e) for e in entries]
+    return comp
+
+@api_router.post("/competitions/{comp_id}/answer")
+async def answer_quiz(comp_id: str, request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    answers = body.get("answers", [])
+    comp = await db.competitions.find_one({"_id": ObjectId(comp_id)})
+    if not comp:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    questions = comp.get("questions", [])
+    correct = sum(1 for i, a in enumerate(answers) if i < len(questions) and a == questions[i].get("correct"))
+    score = correct / max(len(questions), 1) * 100
+    passed = score >= 70
+    if passed:
+        existing = await db.competition_entries.find_one({"competition_id": comp_id, "user_id": user["id"]})
+        if not existing:
+            await db.competition_entries.insert_one({
+                "competition_id": comp_id, "user_id": user["id"], "user_name": user["name"],
+                "user_phone": user["phone"], "score": score, "joined_at": datetime.now(timezone.utc).isoformat()
+            })
+            await db.competitions.update_one({"_id": ObjectId(comp_id)}, {"$inc": {"joined_count": 1}})
+    return {"score": score, "correct": correct, "total": len(questions), "passed": passed}
+
+# ─── Wallet ───
+@api_router.get("/wallet")
+async def get_wallet(user=Depends(get_current_user)):
+    transactions = await db.wallet_transactions.find({"user_id": user["id"]}).sort("created_at", -1).to_list(50)
+    return {"balance": user.get("wallet_balance", 0), "points": user.get("points", 0), "transactions": [serialize_doc(t) for t in transactions]}
+
+# ─── Addresses ───
+@api_router.get("/addresses")
+async def get_addresses(user=Depends(get_current_user)):
+    addrs = await db.addresses.find({"user_id": user["id"]}).to_list(20)
+    return [serialize_doc(a) for a in addrs]
+
+class AddressInput(BaseModel):
+    label: str = "My home"
+    address: str
+    city: str = ""
+    is_default: bool = False
+
+@api_router.post("/addresses")
+async def add_address(data: AddressInput, user=Depends(get_current_user)):
+    if data.is_default:
+        await db.addresses.update_many({"user_id": user["id"]}, {"$set": {"is_default": False}})
+    result = await db.addresses.insert_one({
+        "user_id": user["id"], "label": data.label, "address": data.address,
+        "city": data.city, "is_default": data.is_default, "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    return {"id": str(result.inserted_id), "message": "Address added"}
+
+@api_router.delete("/addresses/{addr_id}")
+async def delete_address(addr_id: str, user=Depends(get_current_user)):
+    await db.addresses.delete_one({"_id": ObjectId(addr_id), "user_id": user["id"]})
+    return {"message": "Address deleted"}
+
+# ─── Paid Ads ───
+@api_router.get("/ads")
+async def get_ads():
+    ads = await db.ads.find({"status": "active"}).sort("created_at", -1).to_list(20)
+    return [serialize_doc(a) for a in ads]
+
+class AdInput(BaseModel):
+    title: str
+    description: str
+    image: str = ""
+    ad_type: str = "banner"
+    duration_days: int = 7
+    budget: float = 0
+
+@api_router.post("/ads")
+async def create_ad(data: AdInput, user=Depends(get_current_user)):
+    result = await db.ads.insert_one({
+        "user_id": user["id"], "title": data.title, "description": data.description,
+        "image": data.image, "ad_type": data.ad_type, "duration_days": data.duration_days,
+        "budget": data.budget, "status": "pending", "views": 0, "clicks": 0,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    return {"id": str(result.inserted_id), "message": "Ad submitted for review"}
+
+@api_router.get("/ads/my")
+async def my_ads(user=Depends(get_current_user)):
+    ads = await db.ads.find({"user_id": user["id"]}).sort("created_at", -1).to_list(20)
+    return [serialize_doc(a) for a in ads]
+
+
+# ─── Services Booking ───
+class ServiceBookInput(BaseModel):
+    service_name: str
+    device_model: str = ""
+    issue_desc: str = ""
+    delivery_type: str = "store"  # store, delivery, home_pickup
+    address: str = ""
+    phone: str = ""
+
+@api_router.get("/services")
+async def get_services():
+    services = await db.services.find({"published": True}).to_list(20)
+    return [serialize_doc(s) for s in services]
+
+@api_router.get("/services/{svc_id}")
+async def get_service(svc_id: str):
+    svc = await db.services.find_one({"_id": ObjectId(svc_id)})
+    if not svc:
+        raise HTTPException(status_code=404, detail="Service not found")
+    return serialize_doc(svc)
+
+@api_router.post("/services/book")
+async def book_service(data: ServiceBookInput, user=Depends(get_current_user)):
+    result = await db.service_bookings.insert_one({
+        "user_id": user["id"], "service_name": data.service_name,
+        "device_model": data.device_model, "issue_desc": data.issue_desc,
+        "delivery_type": data.delivery_type, "address": data.address, "phone": data.phone,
+        "status": "pending", "warranty": True,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    return {"id": str(result.inserted_id), "message": "Service booked successfully"}
+
+@api_router.get("/services/bookings/my")
+async def my_service_bookings(user=Depends(get_current_user)):
+    bookings = await db.service_bookings.find({"user_id": user["id"]}).sort("created_at", -1).to_list(50)
+    return [serialize_doc(b) for b in bookings]
+
+# ─── Support Tickets ───
+class TicketInput(BaseModel):
+    subject: str
+    message: str
+    category: str = "general"
+
+@api_router.get("/support/tickets")
+async def get_tickets(user=Depends(get_current_user)):
+    tickets = await db.support_tickets.find({"user_id": user["id"]}).sort("created_at", -1).to_list(50)
+    return [serialize_doc(t) for t in tickets]
+
+@api_router.post("/support/tickets")
+async def create_ticket(data: TicketInput, user=Depends(get_current_user)):
+    result = await db.support_tickets.insert_one({
+        "user_id": user["id"], "subject": data.subject, "message": data.message,
+        "category": data.category, "status": "open",
+        "replies": [], "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    return {"id": str(result.inserted_id), "message": "Ticket created"}
+
+@api_router.post("/support/tickets/{ticket_id}/reply")
+async def reply_ticket(ticket_id: str, request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    await db.support_tickets.update_one({"_id": ObjectId(ticket_id)}, {"$push": {"replies": {
+        "user_id": user["id"], "user_name": user["name"], "message": body.get("message", ""),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }}})
+    return {"message": "Reply sent"}
+
+# ─── Warranties ───
+@api_router.get("/warranties")
+async def get_warranties(user=Depends(get_current_user)):
+    warranties = await db.warranties.find({"user_id": user["id"]}).sort("created_at", -1).to_list(50)
+    return [serialize_doc(w) for w in warranties]
+
+# ─── Invoices ───
+@api_router.get("/invoices")
+async def get_invoices(user=Depends(get_current_user)):
+    orders = await db.orders.find({"user_id": user["id"]}).sort("created_at", -1).to_list(50)
+    invoices = []
+    for o in orders:
+        o["id"] = str(o.pop("_id"))
+        invoices.append({
+            "id": o["id"], "invoice_no": f"INV-{o['id'][-8:].upper()}",
+            "date": o.get("created_at", ""), "total": o.get("total", 0),
+            "tax": o.get("tax", 0), "subtotal": o.get("subtotal", 0),
+            "items": o.get("items", []), "status": o.get("status", "")
+        })
+    return invoices
+
+
+
+@api_router.delete("/cart/{item_id}")
+async def remove_from_cart(item_id: str, user=Depends(get_current_user)):
+    await db.cart_items.delete_one({"_id": ObjectId(item_id), "user_id": user["id"]})
+    return {"message": "Deleted"}
+
+# ─── Orders ───
+@api_router.get("/orders")
+async def get_orders(user=Depends(get_current_user)):
+    orders = await db.orders.find({"user_id": user["id"]}).sort("created_at", -1).to_list(100)
+    return [serialize_doc(o) for o in orders]
+
+@api_router.post("/orders")
+async def create_order(data: OrderInput, user=Depends(get_current_user)):
+    cart_items = await db.cart_items.find({"user_id": user["id"]}).to_list(100)
+    if not cart_items:
+        raise HTTPException(status_code=400, detail="السلة فارغة")
+    items = []
+    subtotal = 0
+    for ci in cart_items:
+        product = await db.products.find_one({"_id": ObjectId(ci["product_id"])})
+        if product:
+            price = product.get("discount_price") or product["price"]
+            item_total = price * ci["quantity"]
+            subtotal += item_total
+            items.append({
+                "product_id": ci["product_id"],
+                "name": product.get("name_ar", product.get("name_en", "")),
+                "image": product.get("images", [""])[0] if product.get("images") else "",
+                "price": price,
+                "quantity": ci["quantity"],
+                "color": ci.get("color"),
+                "storage": ci.get("storage"),
+                "total": item_total
+            })
+    tax = round(subtotal * 0.15, 2)
+    delivery_cost = 25 if data.delivery_type == "express" else 15
+    total = round(subtotal + tax + delivery_cost, 2)
+    order_doc = {
+        "user_id": user["id"],
+        "items": items,
+        "subtotal": subtotal,
+        "tax": tax,
+        "delivery_cost": delivery_cost,
+        "total": total,
+        "address": data.address,
+        "phone": data.phone,
+        "delivery_type": data.delivery_type,
+        "payment_method": data.payment_method,
+        "notes": data.notes,
+        "status": "processing",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    result = await db.orders.insert_one(order_doc)
+    await db.cart_items.delete_many({"user_id": user["id"]})
+    order_doc["id"] = str(result.inserted_id)
+    order_doc.pop("_id", None)
+    return order_doc
+
+# ─── Profile ───
+@api_router.put("/profile")
+async def update_profile(data: ProfileUpdate, user=Depends(get_current_user)):
+    update = {k: v for k, v in data.dict().items() if v is not None}
+    if update:
+        await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": update})
+    updated = await db.users.find_one({"_id": ObjectId(user["id"])})
+    updated["id"] = str(updated.pop("_id"))
+    updated.pop("password_hash", None)
+    return updated
+
+# ─── Favorites ───
+@api_router.get("/favorites")
+async def get_favorites(user=Depends(get_current_user)):
+    favs = await db.favorites.find({"user_id": user["id"]}).to_list(100)
+    result = []
+    for f in favs:
+        product = await db.products.find_one({"_id": ObjectId(f["product_id"])})
+        if product:
+            p = serialize_doc(product)
+            p["fav_id"] = str(f["_id"])
+            result.append(p)
+    return result
+
+@api_router.post("/favorites/{product_id}")
+async def toggle_favorite(product_id: str, user=Depends(get_current_user)):
+    existing = await db.favorites.find_one({"user_id": user["id"], "product_id": product_id})
+    if existing:
+        await db.favorites.delete_one({"_id": existing["_id"]})
+        return {"favorited": False}
+    await db.favorites.insert_one({"user_id": user["id"], "product_id": product_id, "created_at": datetime.now(timezone.utc).isoformat()})
+    return {"favorited": True}
+
+# ─── Banners ───
+@api_router.get("/banners")
+async def get_banners():
+    banners = await db.banners.find({"published": True}).to_list(20)
+    return [serialize_doc(b) for b in banners]
+
+# ─── Seed Data ───
+
+# ─── Coupons ───
+@api_router.get("/coupons/validate/{code}")
+async def validate_coupon(code: str):
+    coupon = await db.coupons.find_one({"code": code.upper(), "active": True})
+    if not coupon:
+        raise HTTPException(status_code=404, detail="Invalid coupon code")
+    return serialize_doc(coupon)
+
+# ─── Reviews ───
+@api_router.get("/products/{product_id}/reviews")
+async def get_reviews(product_id: str):
+    reviews = await db.reviews.find({"product_id": product_id}).sort("created_at", -1).to_list(50)
+    return [serialize_doc(r) for r in reviews]
+
+class ReviewInput(BaseModel):
+    rating: int = 5
+    comment: str = ""
+
+@api_router.post("/products/{product_id}/reviews")
+async def add_review(product_id: str, data: ReviewInput, user=Depends(get_current_user)):
+    await db.reviews.insert_one({
+        "product_id": product_id, "user_id": user["id"], "user_name": user["name"],
+        "rating": data.rating, "comment": data.comment,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    reviews = await db.reviews.find({"product_id": product_id}).to_list(1000)
+    avg = sum(r["rating"] for r in reviews) / len(reviews) if reviews else 0
+    await db.products.update_one({"_id": ObjectId(product_id)}, {"$set": {"rating": round(avg, 1), "review_count": len(reviews)}})
+    return {"message": "Review added", "avg_rating": round(avg, 1)}
+
+# ─── Order Tracking ───
+@api_router.get("/orders/{order_id}")
+async def get_order_detail(order_id: str, user=Depends(get_current_user)):
+    order = await db.orders.find_one({"_id": ObjectId(order_id), "user_id": user["id"]})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return serialize_doc(order)
+
+@api_router.get("/orders/{order_id}/tracking")
+async def get_order_tracking(order_id: str):
+    order = await db.orders.find_one({"_id": ObjectId(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    tracking = order.get("tracking", {})
+    return {"order_id": order_id, "status": order.get("status", "processing"), "tracking": tracking}
+
+# ─── Delivery Integration Webhooks ───
+@api_router.post("/webhooks/delivery/update")
+async def delivery_webhook(request: Request):
+    body = await request.json()
+    order_id = body.get("order_id")
+    status = body.get("status")
+    driver_name = body.get("driver_name", "")
+    driver_phone = body.get("driver_phone", "")
+    location = body.get("location", {})
+    eta = body.get("eta", "")
+    if order_id:
+        await db.orders.update_one({"_id": ObjectId(order_id)}, {"$set": {
+            "status": status, "tracking": {
+                "driver_name": driver_name, "driver_phone": driver_phone,
+                "location": location, "eta": eta, "last_update": datetime.now(timezone.utc).isoformat()
+            }
+        }})
+    return {"received": True}
+
+@api_router.post("/webhooks/delivery/assigned")
+async def delivery_assigned_webhook(request: Request):
+    body = await request.json()
+    order_id = body.get("order_id")
+    if order_id:
+        await db.orders.update_one({"_id": ObjectId(order_id)}, {"$set": {
+            "status": "out_for_delivery", "tracking.driver_name": body.get("driver_name", ""),
+            "tracking.driver_phone": body.get("driver_phone", ""),
+            "tracking.assigned_at": datetime.now(timezone.utc).isoformat()
+        }})
+    return {"received": True}
+
+# ─── Payment Integration Points ───
+@api_router.post("/payments/create-intent")
+async def create_payment_intent(request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    amount = body.get("amount", 0)
+    method = body.get("method", "card")
+    return {
+        "payment_id": f"pay_{secrets.token_hex(12)}",
+        "amount": amount, "currency": "SAR", "method": method,
+        "status": "pending",
+        "message": "Payment gateway not yet configured. Connect Stripe/Tamara/Apple Pay via webhook.",
+        "integration_required": True,
+        "supported_methods": ["card", "apple_pay", "mada", "tamara_installments", "cash_on_delivery"]
+    }
+
+@api_router.post("/webhooks/payment/confirm")
+async def payment_webhook(request: Request):
+    body = await request.json()
+    order_id = body.get("order_id")
+    payment_status = body.get("status")
+    if order_id and payment_status == "paid":
+        await db.orders.update_one({"_id": ObjectId(order_id)}, {"$set": {"payment_status": "paid"}})
+    return {"received": True}
+
+# ─── Social Posts ───
+@api_router.get("/social/posts")
+async def get_social_posts():
+    posts = await db.social_posts.find({}).sort("created_at", -1).to_list(30)
+    return [serialize_doc(p) for p in posts]
+
+@api_router.post("/social/posts/{post_id}/like")
+async def like_post(post_id: str, user=Depends(get_current_user)):
+    existing = await db.social_likes.find_one({"post_id": post_id, "user_id": user["id"]})
+    if existing:
+        await db.social_likes.delete_one({"_id": existing["_id"]})
+        await db.social_posts.update_one({"_id": ObjectId(post_id)}, {"$inc": {"likes": -1}})
+        return {"liked": False}
+    await db.social_likes.insert_one({"post_id": post_id, "user_id": user["id"]})
+    await db.social_posts.update_one({"_id": ObjectId(post_id)}, {"$inc": {"likes": 1}})
+    return {"liked": True}
+
+@api_router.get("/social/posts/{post_id}/comments")
+async def get_comments(post_id: str):
+    comments = await db.social_comments.find({"post_id": post_id}).sort("created_at", -1).to_list(50)
+    return [serialize_doc(c) for c in comments]
+
+@api_router.post("/social/posts/{post_id}/comments")
+async def add_comment(post_id: str, request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    await db.social_comments.insert_one({
+        "post_id": post_id, "user_id": user["id"], "user_name": user["name"],
+        "text": body.get("text", ""), "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    await db.social_posts.update_one({"_id": ObjectId(post_id)}, {"$inc": {"comments": 1}})
+    return {"message": "Comment added"}
+
+@api_router.post("/social/posts/{post_id}/bookmark")
+async def bookmark_post(post_id: str, user=Depends(get_current_user)):
+    existing = await db.social_bookmarks.find_one({"post_id": post_id, "user_id": user["id"]})
+    if existing:
+        await db.social_bookmarks.delete_one({"_id": existing["_id"]})
+        return {"bookmarked": False}
+    await db.social_bookmarks.insert_one({"post_id": post_id, "user_id": user["id"]})
+    return {"bookmarked": True}
+
+async def seed_data():
+    # Categories
+    if await db.categories.count_documents({}) == 0:
+        categories = [
+            {"name_ar": "هواتف", "name_en": "Phones", "image": "📱", "color1": "#8833FF", "color2": "#AA66FF", "published": True, "order": 1},
+            {"name_ar": "أجهزة لوحية", "name_en": "Tablets", "image": "📲", "color1": "#3366FF", "color2": "#6699FF", "published": True, "order": 2},
+            {"name_ar": "حواسيب", "name_en": "Laptops", "image": "💻", "color1": "#FF6633", "color2": "#FF9966", "published": True, "order": 3},
+            {"name_ar": "اكسسوارات", "name_en": "Accessories", "image": "🎧", "color1": "#33CC66", "color2": "#66FF99", "published": True, "order": 4},
+            {"name_ar": "ساعات ذكية", "name_en": "Smartwatches", "image": "⌚", "color1": "#FF3366", "color2": "#FF6699", "published": True, "order": 5},
+            {"name_ar": "ألعاب", "name_en": "Gaming", "image": "🎮", "color1": "#9933FF", "color2": "#CC66FF", "published": True, "order": 6},
+        ]
+        await db.categories.insert_many(categories)
+        logger.info("Seeded categories")
+
+    # Brands
+    if await db.brands.count_documents({}) == 0:
+        brands = [
+            {"name_ar": "أبل", "name_en": "Apple", "image": "", "published": True},
+            {"name_ar": "سامسونج", "name_en": "Samsung", "image": "", "published": True},
+            {"name_ar": "هواوي", "name_en": "Huawei", "image": "", "published": True},
+            {"name_ar": "شاومي", "name_en": "Xiaomi", "image": "", "published": True},
+            {"name_ar": "سوني", "name_en": "Sony", "image": "", "published": True},
+        ]
+        await db.brands.insert_many(brands)
+        logger.info("Seeded brands")
+
+    # Get category and brand IDs
+    cats = {c["name_en"]: str(c["_id"]) async for c in db.categories.find()}
+    brds = {b["name_en"]: str(b["_id"]) async for b in db.brands.find()}
+
+    # Products
+    if await db.products.count_documents({}) == 0:
+        products = [
+            {
+                "name_ar": "آيفون 15 برو ماكس", "name_en": "iPhone 15 Pro Max",
+                "description_ar": "أحدث هاتف من أبل بمعالج A17 Pro وكاميرا 48 ميغابيكسل",
+                "description_en": "Latest Apple phone with A17 Pro chip and 48MP camera",
+                "category_id": cats.get("Phones", ""), "brand_id": brds.get("Apple", ""),
+                "price": 4999, "discount_price": 4499, "condition": "new",
+                "colors": [{"name": "تيتانيوم طبيعي", "hex": "#A0A0A0"}, {"name": "تيتانيوم أزرق", "hex": "#3D4F7C"}, {"name": "تيتانيوم أسود", "hex": "#2C2C2C"}],
+                "storage_options": ["256GB", "512GB", "1TB"],
+                "images": ["https://images.unsplash.com/photo-1615655406736-b37c4fabf923?w=400"],
+                "specs": {"screen": "6.7 بوصة", "camera": "48 MP", "battery": "4441 mAh", "os": "iOS 17", "processor": "A17 Pro"},
+                "rating": 4.8, "review_count": 234, "sold_count": 1520,
+                "in_stock": True, "featured": True, "published": True,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                "name_ar": "سامسونج جالكسي S24 ألترا", "name_en": "Samsung Galaxy S24 Ultra",
+                "description_ar": "هاتف رائد بقلم S Pen ومعالج Snapdragon 8 Gen 3",
+                "description_en": "Flagship phone with S Pen and Snapdragon 8 Gen 3",
+                "category_id": cats.get("Phones", ""), "brand_id": brds.get("Samsung", ""),
+                "price": 4799, "discount_price": None, "condition": "new",
+                "colors": [{"name": "رمادي تيتانيوم", "hex": "#A0A0A0"}, {"name": "بنفسجي", "hex": "#8833FF"}],
+                "storage_options": ["256GB", "512GB"],
+                "images": ["https://images.pexels.com/photos/6373185/pexels-photo-6373185.jpeg?w=400"],
+                "specs": {"screen": "6.8 بوصة", "camera": "200 MP", "battery": "5000 mAh", "os": "Android 14", "processor": "Snapdragon 8 Gen 3"},
+                "rating": 4.7, "review_count": 189, "sold_count": 980,
+                "in_stock": True, "featured": True, "published": True,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                "name_ar": "ماك بوك برو 16", "name_en": "MacBook Pro 16",
+                "description_ar": "لابتوب احترافي بمعالج M3 Max وشاشة Liquid Retina XDR",
+                "description_en": "Professional laptop with M3 Max chip",
+                "category_id": cats.get("Laptops", ""), "brand_id": brds.get("Apple", ""),
+                "price": 12999, "discount_price": 11999, "condition": "new",
+                "colors": [{"name": "فضي", "hex": "#C0C0C0"}, {"name": "رمادي فلكي", "hex": "#52525B"}],
+                "storage_options": ["512GB", "1TB", "2TB"],
+                "images": ["https://images.unsplash.com/photo-1622131815526-eaae1e615381?w=400"],
+                "specs": {"screen": "16.2 بوصة", "processor": "M3 Max", "ram": "36GB", "battery": "22 ساعة"},
+                "rating": 4.9, "review_count": 156, "sold_count": 450,
+                "in_stock": True, "featured": True, "published": True,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                "name_ar": "سماعات سوني WH-1000XM5", "name_en": "Sony WH-1000XM5",
+                "description_ar": "أفضل سماعات لاسلكية مع إلغاء الضوضاء",
+                "description_en": "Best noise cancelling wireless headphones",
+                "category_id": cats.get("Accessories", ""), "brand_id": brds.get("Sony", ""),
+                "price": 1499, "discount_price": 1299, "condition": "new",
+                "colors": [{"name": "أسود", "hex": "#1A1A1A"}, {"name": "فضي", "hex": "#D4D4D4"}],
+                "storage_options": [],
+                "images": ["https://images.unsplash.com/photo-1584585696759-1df9872e1eca?w=400"],
+                "specs": {"type": "Over-ear", "battery": "30 ساعة", "noise_cancelling": "نعم"},
+                "rating": 4.6, "review_count": 312, "sold_count": 2100,
+                "in_stock": True, "featured": True, "published": True,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                "name_ar": "آيباد برو 12.9", "name_en": "iPad Pro 12.9",
+                "description_ar": "جهاز لوحي احترافي بمعالج M2 وشاشة Liquid Retina XDR",
+                "description_en": "Professional tablet with M2 chip",
+                "category_id": cats.get("Tablets", ""), "brand_id": brds.get("Apple", ""),
+                "price": 5499, "discount_price": 4999, "condition": "new",
+                "colors": [{"name": "فضي", "hex": "#C0C0C0"}, {"name": "رمادي فلكي", "hex": "#52525B"}],
+                "storage_options": ["128GB", "256GB", "512GB"],
+                "images": ["https://images.unsplash.com/photo-1615655406736-b37c4fabf923?w=400"],
+                "specs": {"screen": "12.9 بوصة", "processor": "M2", "camera": "12 MP"},
+                "rating": 4.8, "review_count": 98, "sold_count": 670,
+                "in_stock": True, "featured": True, "published": True,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                "name_ar": "آيفون 14 (مستعمل)", "name_en": "iPhone 14 (Used)",
+                "description_ar": "آيفون 14 بحالة ممتازة - مستعمل 3 أشهر",
+                "description_en": "iPhone 14 excellent condition - used 3 months",
+                "category_id": cats.get("Phones", ""), "brand_id": brds.get("Apple", ""),
+                "price": 2499, "discount_price": None, "condition": "used_3months",
+                "colors": [{"name": "أزرق", "hex": "#007AFF"}],
+                "storage_options": ["128GB"],
+                "images": ["https://images.unsplash.com/photo-1615655406736-b37c4fabf923?w=400"],
+                "specs": {"screen": "6.1 بوصة", "camera": "12 MP", "battery": "3279 mAh", "os": "iOS 16"},
+                "rating": 4.3, "review_count": 45, "sold_count": 89,
+                "in_stock": True, "featured": False, "published": True,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            },
+        ]
+        await db.products.insert_many(products)
+        logger.info("Seeded products")
+
+    # Banners
+    if await db.banners.count_documents({}) == 0:
+        banners = [
+            {"image": "https://static.prod-images.emergentagent.com/jobs/1b8cc0c8-b963-4a1c-bce2-669eb6f422fe/images/e874d8f809b3aaef7868dce4ab57f3c50ea7e11c675912acf52fd5c8d55aa860.png", "title_ar": "أحدث الهواتف الذكية", "title_en": "Latest Smartphones", "published": True, "type": "normal", "order": 1},
+            {"image": "https://static.prod-images.emergentagent.com/jobs/1b8cc0c8-b963-4a1c-bce2-669eb6f422fe/images/0286d868506d9e717ac406005d8b87d3400d9c4ab4f6359abe8041f602b223fa.png", "title_ar": "عروض الساعات والسماعات", "title_en": "Watch & Earbuds Deals", "published": True, "type": "normal", "order": 2},
+        ]
+        await db.banners.insert_many(banners)
+        logger.info("Seeded banners")
+
+    # Seed test user
+    if await db.users.count_documents({"phone": "0500000000"}) == 0:
+        await db.users.insert_one({
+            "phone": "0500000000", "password_hash": hash_password("test1234"),
+            "name": "Maxwell Anderson", "email": "maxwell.anderson@example.com",
+            "city": "Riyadh", "gender": "male", "role": "user",
+            "points": 199, "wallet_balance": 50,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+        logger.info("Seeded test user")
+
+    # Seed Chamber of Commerce account
+    if await db.users.count_documents({"phone": "0550000000"}) == 0:
+        await db.users.insert_one({
+            "phone": "0550000000", "password_hash": hash_password("chamber2025"),
+            "name": "Chamber of Commerce", "email": "chamber@commerce.gov.sa",
+            "city": "Riyadh", "gender": "", "role": "chamber",
+            "points": 0, "wallet_balance": 0,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+        logger.info("Seeded Chamber of Commerce account")
+
+    # Seed competitions
+    if await db.competitions.count_documents({}) == 0:
+        comps = [
+            {
+                "title": "Spend & Win: Eid Special Draw", "type": "spend_win",
+                "description": "Spend $100 or more between April 15-May 10 and enter our Eid prize draw to win amazing gifts!",
+                "prize": "Win 1 of 5 iPhone 15s", "prize_count": 5,
+                "status": "open", "spend_requirement": 100,
+                "start_date": "2025-04-15", "end_date": "2025-05-10", "draw_date": "2025-05-11",
+                "max_participants": 1000, "joined_count": 237,
+                "questions": [
+                    {"q": "What day is the iPhone 14 release date?", "options": ["September 16, 2022", "September 16, 2020", "September 16, 2019"], "correct": 0},
+                    {"q": "Which company makes Galaxy phones?", "options": ["Apple", "Samsung", "Huawei"], "correct": 1},
+                    {"q": "What is the latest iPhone model?", "options": ["iPhone 15", "iPhone 16", "iPhone 14"], "correct": 1},
+                    {"q": "How much RAM does iPhone 16 Pro have?", "options": ["6GB", "8GB", "12GB"], "correct": 1},
+                    {"q": "What chip does MacBook Pro 2024 use?", "options": ["M2", "M3", "M4"], "correct": 2},
+                ],
+                "winners": [],
+                "created_at": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                "title": "Summer Tech Giveaway", "type": "spend_win",
+                "description": "Purchase any laptop and get a chance to win a MacBook Pro!",
+                "prize": "Win MacBook Pro 16\"", "prize_count": 1,
+                "status": "coming_soon", "spend_requirement": 500,
+                "start_date": "2025-06-01", "end_date": "2025-06-30", "draw_date": "2025-07-01",
+                "max_participants": 500, "joined_count": 0,
+                "questions": [], "winners": [],
+                "created_at": datetime.now(timezone.utc).isoformat()
+            },
+            {
+                "title": "Accessories Bundle Draw", "type": "spend_win",
+                "description": "Buy 3 accessories and enter the draw for a complete Apple ecosystem bundle",
+                "prize": "Win Apple Ecosystem Bundle", "prize_count": 3,
+                "status": "ended", "spend_requirement": 200,
+                "start_date": "2025-01-01", "end_date": "2025-01-31", "draw_date": "2025-02-01",
+                "max_participants": 500, "joined_count": 500,
+                "questions": [],
+                "winners": [
+                    {"user_name": "Bader Alhariri", "user_phone": "(555) 123-****"},
+                    {"user_name": "Sophia Anderson", "user_phone": "(555) 456-****"},
+                    {"user_name": "Ethan Smith", "user_phone": "(555) 789-****"},
+                ],
+                "created_at": datetime.now(timezone.utc).isoformat()
+            },
+        ]
+        await db.competitions.insert_many(comps)
+        logger.info("Seeded competitions")
+
+        # Seed participants for Eid draw
+        comp_eid = await db.competitions.find_one({"title": "Spend & Win: Eid Special Draw"})
+        if comp_eid:
+            participants = [
+                {"competition_id": str(comp_eid["_id"]), "user_id": "fake1", "user_name": "Bader Alhariri", "user_phone": "(555) 123-****", "joined_at": datetime.now(timezone.utc).isoformat()},
+                {"competition_id": str(comp_eid["_id"]), "user_id": "fake2", "user_name": "Sophia Anderson", "user_phone": "(555) 456-****", "joined_at": datetime.now(timezone.utc).isoformat()},
+                {"competition_id": str(comp_eid["_id"]), "user_id": "fake3", "user_name": "Ethan Smith", "user_phone": "(555) 789-****", "joined_at": datetime.now(timezone.utc).isoformat()},
+                {"competition_id": str(comp_eid["_id"]), "user_id": "fake4", "user_name": "Ahmed Al-Rashid", "user_phone": "(555) 321-****", "joined_at": datetime.now(timezone.utc).isoformat()},
+                {"competition_id": str(comp_eid["_id"]), "user_id": "fake5", "user_name": "Fatima Hassan", "user_phone": "(555) 654-****", "joined_at": datetime.now(timezone.utc).isoformat()},
+            ]
+            await db.competition_entries.insert_many(participants)
+
+    # Seed ads
+    if await db.ads.count_documents({}) == 0:
+        ads = [
+            {"user_id": "store", "title": "iPhone 16 Pro - Limited Offer!", "description": "Get the new iPhone 16 Pro at special launch price. Limited stock!", "image": "https://images.unsplash.com/photo-1615655406736-b37c4fabf923?w=400", "ad_type": "banner", "duration_days": 30, "budget": 500, "status": "active", "views": 12450, "clicks": 892, "created_at": datetime.now(timezone.utc).isoformat()},
+            {"user_id": "store", "title": "Screen Repair 50% OFF", "description": "Professional screen repair service now 50% off for all models!", "image": "", "ad_type": "feed", "duration_days": 14, "budget": 200, "status": "active", "views": 8320, "clicks": 534, "created_at": datetime.now(timezone.utc).isoformat()},
+            {"user_id": "store", "title": "Trade-in Your Old Phone", "description": "Get up to 2000 SAR for your old device when you upgrade", "image": "", "ad_type": "story", "duration_days": 7, "budget": 150, "status": "active", "views": 5670, "clicks": 321, "created_at": datetime.now(timezone.utc).isoformat()},
+        ]
+        await db.ads.insert_many(ads)
+        logger.info("Seeded ads")
+
+    # Seed wallet transactions
+    if await db.wallet_transactions.count_documents({}) == 0:
+        test_user = await db.users.find_one({"phone": "0500000000"})
+        if test_user:
+            uid = str(test_user["_id"])
+            txns = [
+                {"user_id": uid, "type": "credit", "amount": 50, "description": "Welcome bonus", "created_at": "2025-03-01T10:00:00Z"},
+                {"user_id": uid, "type": "points", "amount": 100, "description": "Purchase reward - iPhone case", "created_at": "2025-03-15T14:00:00Z"},
+                {"user_id": uid, "type": "points", "amount": 99, "description": "Competition entry reward", "created_at": "2025-04-01T09:00:00Z"},
+            ]
+            await db.wallet_transactions.insert_many(txns)
+
+    # Seed addresses
+    if await db.addresses.count_documents({}) == 0:
+        test_user = await db.users.find_one({"phone": "0500000000"})
+        if test_user:
+            uid = str(test_user["_id"])
+            await db.addresses.insert_many([
+                {"user_id": uid, "label": "My home", "address": "65, Ar Rahmaniyyah, Riyadh 12215, Saudi Arabia", "city": "Riyadh", "is_default": True, "created_at": datetime.now(timezone.utc).isoformat()},
+                {"user_id": uid, "label": "Office", "address": "King Fahad Road, Al Olaya, Riyadh", "city": "Riyadh", "is_default": False, "created_at": datetime.now(timezone.utc).isoformat()},
+            ])
+
+    # Seed services
+    if await db.services.count_documents({}) == 0:
+        services = [
+            {"name": "Screen Repair", "desc": "Professional screen replacement for all phone models", "icon": "phone-portrait", "color": "#8833FF",
+             "price": 199, "inspection_price": 11, "total_requests": 423, "turnaround": "1-2 Days",
+             "delivery_available": True, "home_pickup": True, "warranty_available": True, "warranty_days": 90,
+             "rating": 4.7, "review_count": 134, "published": True},
+            {"name": "Battery Replacement", "desc": "Genuine battery replacement with warranty", "icon": "battery-charging", "color": "#10B981",
+             "price": 149, "inspection_price": 11, "total_requests": 312, "turnaround": "1 Day",
+             "delivery_available": True, "home_pickup": True, "warranty_available": True, "warranty_days": 180,
+             "rating": 4.8, "review_count": 98, "published": True},
+            {"name": "Water Damage Repair", "desc": "Advanced water damage recovery service", "icon": "water", "color": "#3B82F6",
+             "price": 299, "inspection_price": 25, "total_requests": 187, "turnaround": "2-3 Days",
+             "delivery_available": True, "home_pickup": False, "warranty_available": True, "warranty_days": 30,
+             "rating": 4.3, "review_count": 67, "published": True},
+            {"name": "Software Fix", "desc": "OS updates, virus removal, data recovery", "icon": "code-slash", "color": "#F59E0B",
+             "price": 99, "inspection_price": 0, "total_requests": 256, "turnaround": "Same Day",
+             "delivery_available": False, "home_pickup": False, "warranty_available": False, "warranty_days": 0,
+             "rating": 4.6, "review_count": 89, "published": True},
+            {"name": "Device Inspection", "desc": "Full device health check and diagnostic report", "icon": "search", "color": "#EC4899",
+             "price": 49, "inspection_price": 0, "total_requests": 145, "turnaround": "Same Day",
+             "delivery_available": False, "home_pickup": False, "warranty_available": False, "warranty_days": 0,
+             "rating": 4.9, "review_count": 156, "published": True},
+            {"name": "Charging Port Fix", "desc": "Repair or replace damaged charging ports", "icon": "flash", "color": "#EF4444",
+             "price": 129, "inspection_price": 11, "total_requests": 198, "turnaround": "1 Day",
+             "delivery_available": True, "home_pickup": True, "warranty_available": True, "warranty_days": 60,
+             "rating": 4.5, "review_count": 78, "published": True},
+        ]
+        await db.services.insert_many(services)
+        logger.info("Seeded services")
+
+    # Seed warranties for test user
+    if await db.warranties.count_documents({}) == 0:
+        test_user = await db.users.find_one({"phone": "0500000000"})
+        if test_user:
+            uid = str(test_user["_id"])
+            await db.warranties.insert_many([
+                {"user_id": uid, "product_name": "iPhone 15 Pro Max Screen", "service_name": "Screen Repair",
+                 "warranty_days": 90, "start_date": "2025-03-01", "end_date": "2025-05-30",
+                 "status": "active", "order_id": "ORD-001", "created_at": datetime.now(timezone.utc).isoformat()},
+                {"user_id": uid, "product_name": "Samsung S24 Battery", "service_name": "Battery Replacement",
+                 "warranty_days": 180, "start_date": "2025-01-15", "end_date": "2025-07-14",
+                 "status": "active", "order_id": "ORD-002", "created_at": datetime.now(timezone.utc).isoformat()},
+            ])
+            logger.info("Seeded warranties")
+
+    # Seed support tickets
+    if await db.support_tickets.count_documents({}) == 0:
+        test_user = await db.users.find_one({"phone": "0500000000"})
+        if test_user:
+            uid = str(test_user["_id"])
+            await db.support_tickets.insert_many([
+                {"user_id": uid, "subject": "Order delivery delay", "message": "My order has been processing for 3 days",
+                 "category": "orders", "status": "open", "replies": [
+                    {"user_name": "Support Team", "message": "We're looking into this. Your order will be shipped today.", "created_at": "2025-04-10T10:00:00Z"}
+                 ], "created_at": "2025-04-09T14:00:00Z"},
+                {"user_id": uid, "subject": "Screen repair warranty", "message": "Screen has issues after repair",
+                 "category": "services", "status": "resolved", "replies": [
+                    {"user_name": "Support Team", "message": "Please bring the device to the store for free inspection under warranty.", "created_at": "2025-03-20T09:00:00Z"}
+                 ], "created_at": "2025-03-19T16:00:00Z"},
+            ])
+            logger.info("Seeded support tickets")
+
+    # Seed coupons
+    if await db.coupons.count_documents({}) == 0:
+        await db.coupons.insert_many([
+            {"code": "WELCOME10", "discount_type": "percent", "discount_value": 10, "min_order": 100, "max_discount": 50, "active": True},
+            {"code": "FLAT50", "discount_type": "fixed", "discount_value": 50, "min_order": 200, "max_discount": 50, "active": True},
+            {"code": "EID25", "discount_type": "percent", "discount_value": 25, "min_order": 500, "max_discount": 200, "active": True},
+        ])
+        logger.info("Seeded coupons")
+
+    # Seed social posts
+    if await db.social_posts.count_documents({}) == 0:
+        await db.social_posts.insert_many([
+            {"author": "Tech Store", "text": "Welcome to our new store! We are excited to serve you with the latest technology products.", "image": "https://images.unsplash.com/photo-1441986300917-64674bd600d8?w=400", "likes": 78000, "comments": 201, "views": 1345, "type": "post", "created_at": datetime.now(timezone.utc).isoformat()},
+            {"author": "Tech Store", "text": "Check out our latest collection of iPhone 16 cases and accessories!", "image": "https://images.unsplash.com/photo-1615655406736-b37c4fabf923?w=400", "likes": 12400, "comments": 87, "views": 892, "type": "post", "created_at": datetime.now(timezone.utc).isoformat()},
+            {"author": "Tech Store", "text": "What is the best Phone this year!", "type": "poll", "poll_options": [{"text": "iPhone 16 Pro", "votes": 45}, {"text": "Samsung S25 Ultra", "votes": 32}, {"text": "Google Pixel 9 Pro", "votes": 18}, {"text": "Other", "votes": 5}], "likes": 5200, "comments": 156, "views": 2156, "created_at": datetime.now(timezone.utc).isoformat()},
+            {"author": "Tech Store", "text": "Big sale this weekend! Amazing deals on all Samsung products.", "image": "https://images.pexels.com/photos/6373185/pexels-photo-6373185.jpeg?w=400", "likes": 23100, "comments": 342, "views": 3420, "type": "post", "is_ad": True, "ad_label": "Sponsored", "created_at": datetime.now(timezone.utc).isoformat()},
+        ])
+        logger.info("Seeded social posts")
+
+    # Indexes
+    await db.users.create_index("phone", unique=True)
+    await db.products.create_index([("name_ar", "text"), ("name_en", "text")])
+
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def startup():
+    await seed_data()
+    logger.info("Tech Store API started")
+
+@app.on_event("shutdown")
+async def shutdown():
+    client.close()
