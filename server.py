@@ -1191,7 +1191,6 @@ cloudinary.config(
 
 @api_router.post("/upload/signature")
 async def get_upload_signature(request: Request, user=Depends(get_current_user)):
-    """Generate signed upload params for direct client → Cloudinary upload."""
     body = await request.json()
     folder = body.get("folder", "zitex/general")
     resource_type = body.get("resource_type", "auto")
@@ -1199,14 +1198,322 @@ async def get_upload_signature(request: Request, user=Depends(get_current_user))
     timestamp = int(time.time())
     params_to_sign = {"timestamp": timestamp, "folder": folder}
     signature = cloudinary.utils.api_sign_request(params_to_sign, cloudinary.config().api_secret)
-    return {
-        "signature": signature,
-        "timestamp": timestamp,
-        "api_key": cloudinary.config().api_key,
-        "cloud_name": cloudinary.config().cloud_name,
-        "folder": folder,
-        "resource_type": resource_type,
-    }
+    return {"signature": signature, "timestamp": timestamp,
+            "api_key": cloudinary.config().api_key, "cloud_name": cloudinary.config().cloud_name,
+            "folder": folder, "resource_type": resource_type}
+
+# ═══════════════════════════════════════════════════
+# DELIVERY SYSTEM (branches + drivers + assignments + tracking)
+# ═══════════════════════════════════════════════════
+import math
+
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "AIzaSyDEQ58ECgaiL1XXWguUecTRKsPMxO6wMZE")
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Calculate distance in km between two GPS points."""
+    R = 6371
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
+
+def require_driver(user):
+    if user.get("role") != "driver":
+        raise HTTPException(status_code=403, detail="Driver access only")
+
+# ─── Branches CRUD (merchant) ───
+class BranchInput(BaseModel):
+    name: str
+    address: str
+    lat: float
+    lng: float
+    phone: str = ""
+    open_hours: str = "9:00 AM - 11:00 PM"
+    published: bool = True
+
+@api_router.get("/branches")
+async def list_branches():
+    bs = await db.branches.find({"published": True}).to_list(50)
+    return [serialize_doc(b) for b in bs]
+
+@api_router.get("/branches/nearest")
+async def nearest_branch(lat: float, lng: float):
+    bs = await db.branches.find({"published": True}).to_list(50)
+    if not bs: return {"branch": None, "distance_km": 0}
+    sorted_bs = sorted(bs, key=lambda b: haversine_km(lat, lng, b.get("lat", 0), b.get("lng", 0)))
+    nearest = sorted_bs[0]
+    nearest["id"] = str(nearest.pop("_id"))
+    nearest["distance_km"] = round(haversine_km(lat, lng, nearest.get("lat", 0), nearest.get("lng", 0)), 2)
+    return {"branch": nearest, "distance_km": nearest["distance_km"]}
+
+@api_router.post("/merchant/branches")
+async def create_branch(data: BranchInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    r = await db.branches.insert_one(data.model_dump())
+    return {"id": str(r.inserted_id)}
+
+@api_router.put("/merchant/branches/{bid}")
+async def update_branch(bid: str, data: BranchInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.branches.update_one({"_id": ObjectId(bid)}, {"$set": data.model_dump()})
+    return {"message": "Updated"}
+
+@api_router.delete("/merchant/branches/{bid}")
+async def delete_branch(bid: str, user=Depends(get_current_user)):
+    require_merchant(user)
+    await db.branches.delete_one({"_id": ObjectId(bid)})
+    return {"message": "Deleted"}
+
+# ─── Delivery Settings (merchant) ───
+@api_router.get("/delivery/settings")
+async def get_delivery_settings():
+    s = await db.settings.find_one({"key": "delivery"})
+    if not s:
+        s = {"base_fee": 10, "base_distance_km": 10, "per_km_rate": 1.2,
+             "free_delivery_threshold": 0, "max_distance_km": 50}
+    s.pop("_id", None); s.pop("key", None)
+    return s
+
+@api_router.put("/merchant/delivery/settings")
+async def update_delivery_settings(request: Request, user=Depends(get_current_user)):
+    require_merchant(user)
+    body = await request.json()
+    await db.settings.update_one({"key": "delivery"}, {"$set": {**body, "key": "delivery"}}, upsert=True)
+    return {"message": "Updated"}
+
+@api_router.post("/delivery/calculate-fee")
+async def calculate_delivery_fee(request: Request):
+    body = await request.json()
+    distance_km = body.get("distance_km", 0)
+    s = await db.settings.find_one({"key": "delivery"}) or {}
+    base_fee = s.get("base_fee", 10)
+    base_dist = s.get("base_distance_km", 10)
+    per_km = s.get("per_km_rate", 1.2)
+    if distance_km <= base_dist:
+        fee = base_fee
+    else:
+        fee = base_fee + (distance_km - base_dist) * per_km
+    return {"distance_km": distance_km, "delivery_fee": round(fee, 2), "base_fee": base_fee, "base_distance_km": base_dist, "per_km_rate": per_km}
+
+# ─── Drivers CRUD (merchant) ───
+class DriverInput(BaseModel):
+    name: str
+    phone: str
+    password: str = ""
+    vehicle_info: str = ""
+    payment_model: str = "commission"  # "salary" | "commission"
+    salary_monthly: float = 0
+    bonus_threshold_orders: int = 20
+    bonus_per_extra_order: float = 2
+    commission_type: str = "fixed"  # "fixed" | "percentage"
+    merchant_commission_value: float = 5  # SAR (fixed) or % of delivery fee
+
+@api_router.post("/merchant/drivers")
+async def create_driver(data: DriverInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    if await db.users.count_documents({"phone": data.phone}) > 0:
+        raise HTTPException(status_code=400, detail="Phone already exists")
+    user_doc = {"phone": data.phone, "password_hash": hash_password(data.password or "driver1234"),
+                "name": data.name, "email": "", "city": "", "gender": "", "role": "driver",
+                "points": 0, "wallet_balance": 0,
+                "created_at": datetime.now(timezone.utc).isoformat()}
+    u = await db.users.insert_one(user_doc)
+    driver_doc = {"user_id": str(u.inserted_id), "vehicle_info": data.vehicle_info,
+                  "payment_model": data.payment_model, "salary_monthly": data.salary_monthly,
+                  "bonus_threshold_orders": data.bonus_threshold_orders, "bonus_per_extra_order": data.bonus_per_extra_order,
+                  "commission_type": data.commission_type, "merchant_commission_value": data.merchant_commission_value,
+                  "online": False, "current_lat": 0, "current_lng": 0, "last_location_at": "",
+                  "total_deliveries": 0, "today_deliveries": 0, "today_earnings": 0,
+                  "created_at": datetime.now(timezone.utc).isoformat()}
+    await db.drivers.insert_one(driver_doc)
+    return {"id": str(u.inserted_id), "message": "Driver created"}
+
+@api_router.get("/merchant/drivers")
+async def list_drivers(user=Depends(get_current_user)):
+    require_merchant(user)
+    drivers = await db.drivers.find({}).to_list(100)
+    result = []
+    for d in drivers:
+        d["id"] = str(d.pop("_id"))
+        u = await db.users.find_one({"_id": ObjectId(d["user_id"])}) if ObjectId.is_valid(d.get("user_id", "")) else None
+        if u:
+            d["name"] = u.get("name", "")
+            d["phone"] = u.get("phone", "")
+            d["wallet_balance"] = u.get("wallet_balance", 0)
+        result.append(d)
+    return result
+
+@api_router.put("/merchant/drivers/{did}")
+async def update_driver(did: str, data: DriverInput, user=Depends(get_current_user)):
+    require_merchant(user)
+    upd = data.model_dump(); upd.pop("phone", None); upd.pop("password", None)
+    await db.drivers.update_one({"_id": ObjectId(did)}, {"$set": upd})
+    return {"message": "Updated"}
+
+@api_router.delete("/merchant/drivers/{did}")
+async def delete_driver(did: str, user=Depends(get_current_user)):
+    require_merchant(user)
+    d = await db.drivers.find_one({"_id": ObjectId(did)})
+    if d and d.get("user_id"):
+        await db.users.delete_one({"_id": ObjectId(d["user_id"])})
+    await db.drivers.delete_one({"_id": ObjectId(did)})
+    return {"message": "Deleted"}
+
+# ─── Driver Endpoints (driver-only) ───
+@api_router.get("/driver/profile")
+async def driver_profile(user=Depends(get_current_user)):
+    require_driver(user)
+    d = await db.drivers.find_one({"user_id": user["id"]})
+    if not d: raise HTTPException(status_code=404, detail="Driver profile not found")
+    d["id"] = str(d.pop("_id"))
+    d["name"] = user.get("name", ""); d["phone"] = user.get("phone", "")
+    d["wallet_balance"] = user.get("wallet_balance", 0)
+    return d
+
+@api_router.post("/driver/online")
+async def set_driver_online(request: Request, user=Depends(get_current_user)):
+    require_driver(user)
+    body = await request.json()
+    await db.drivers.update_one({"user_id": user["id"]}, {"$set": {"online": bool(body.get("online", True))}})
+    return {"message": "Status updated"}
+
+@api_router.post("/driver/location")
+async def update_driver_location(request: Request, user=Depends(get_current_user)):
+    require_driver(user)
+    body = await request.json()
+    await db.drivers.update_one({"user_id": user["id"]}, {"$set": {
+        "current_lat": body.get("lat", 0), "current_lng": body.get("lng", 0),
+        "last_location_at": datetime.now(timezone.utc).isoformat()}})
+    return {"message": "Location updated"}
+
+@api_router.get("/driver/active-orders")
+async def driver_active_orders(user=Depends(get_current_user)):
+    require_driver(user)
+    orders = await db.orders.find({"driver_id": user["id"], "status": {"$in": ["assigned", "picked_up"]}}).to_list(20)
+    return [serialize_doc(o) for o in orders]
+
+@api_router.get("/driver/available-orders")
+async def driver_available_orders(user=Depends(get_current_user)):
+    require_driver(user)
+    orders = await db.orders.find({"status": "ready_for_pickup", "driver_id": {"$in": [None, ""]}}).sort("created_at", 1).to_list(20)
+    return [serialize_doc(o) for o in orders]
+
+@api_router.post("/driver/orders/{oid}/accept")
+async def driver_accept_order(oid: str, user=Depends(get_current_user)):
+    require_driver(user)
+    o = await db.orders.find_one({"_id": ObjectId(oid)})
+    if not o: raise HTTPException(status_code=404, detail="Not found")
+    if o.get("driver_id"): raise HTTPException(status_code=400, detail="Already assigned")
+    await db.orders.update_one({"_id": ObjectId(oid)}, {"$set": {
+        "driver_id": user["id"], "driver_name": user.get("name", ""),
+        "driver_phone": user.get("phone", ""), "status": "assigned",
+        "accepted_at": datetime.now(timezone.utc).isoformat()}})
+    return {"message": "Accepted"}
+
+@api_router.post("/driver/orders/{oid}/pickup")
+async def driver_pickup_order(oid: str, user=Depends(get_current_user)):
+    require_driver(user)
+    await db.orders.update_one({"_id": ObjectId(oid), "driver_id": user["id"]},
+        {"$set": {"status": "picked_up", "picked_up_at": datetime.now(timezone.utc).isoformat()}})
+    return {"message": "Picked up"}
+
+@api_router.post("/driver/orders/{oid}/deliver")
+async def driver_deliver_order(oid: str, user=Depends(get_current_user)):
+    require_driver(user)
+    o = await db.orders.find_one({"_id": ObjectId(oid), "driver_id": user["id"]})
+    if not o: raise HTTPException(status_code=404, detail="Not found")
+    # Calculate earnings
+    d = await db.drivers.find_one({"user_id": user["id"]})
+    delivery_fee = o.get("delivery_fee", 0)
+    earnings = 0
+    merchant_cut = 0
+    if d and d.get("payment_model") == "commission":
+        if d.get("commission_type") == "percentage":
+            merchant_cut = delivery_fee * (d.get("merchant_commission_value", 0) / 100)
+        else:
+            merchant_cut = d.get("merchant_commission_value", 0)
+        earnings = max(delivery_fee - merchant_cut, 0)
+    # Update order
+    await db.orders.update_one({"_id": ObjectId(oid)}, {"$set": {
+        "status": "delivered", "delivered_at": datetime.now(timezone.utc).isoformat(),
+        "driver_earnings": earnings, "merchant_cut": merchant_cut}})
+    # Add earnings to driver wallet
+    if earnings > 0:
+        await db.users.update_one({"_id": ObjectId(user["id"])}, {"$inc": {"wallet_balance": earnings}})
+        await db.driver_transactions.insert_one({
+            "driver_id": user["id"], "order_id": oid, "amount": earnings,
+            "type": "delivery_earnings", "created_at": datetime.now(timezone.utc).isoformat()})
+    # Update driver stats
+    today = datetime.now(timezone.utc).date().isoformat()
+    await db.drivers.update_one({"user_id": user["id"]}, {"$inc": {"total_deliveries": 1, "today_deliveries": 1, "today_earnings": earnings}})
+    return {"message": "Delivered", "earnings": earnings}
+
+@api_router.get("/driver/history")
+async def driver_history(user=Depends(get_current_user)):
+    require_driver(user)
+    orders = await db.orders.find({"driver_id": user["id"], "status": "delivered"}).sort("delivered_at", -1).limit(50).to_list(50)
+    return [serialize_doc(o) for o in orders]
+
+@api_router.get("/driver/transactions")
+async def driver_transactions(user=Depends(get_current_user)):
+    require_driver(user)
+    txs = await db.driver_transactions.find({"driver_id": user["id"]}).sort("created_at", -1).limit(100).to_list(100)
+    return [serialize_doc(t) for t in txs]
+
+# ─── Customer Location & Order Tracking ───
+@api_router.put("/users/me/location")
+async def save_user_location(request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    await db.users.update_one({"_id": ObjectId(user["id"])}, {"$set": {
+        "default_lat": body.get("lat", 0), "default_lng": body.get("lng", 0),
+        "default_address": body.get("address", "")}})
+    return {"message": "Location saved"}
+
+@api_router.get("/orders/{oid}/tracking")
+async def order_tracking(oid: str, user=Depends(get_current_user)):
+    o = await db.orders.find_one({"_id": ObjectId(oid)})
+    if not o: raise HTTPException(status_code=404, detail="Not found")
+    o["id"] = str(o.pop("_id"))
+    if o.get("driver_id"):
+        d = await db.drivers.find_one({"user_id": o["driver_id"]})
+        if d:
+            o["driver_lat"] = d.get("current_lat", 0)
+            o["driver_lng"] = d.get("current_lng", 0)
+            o["driver_last_seen"] = d.get("last_location_at", "")
+    return o
+
+# ─── Auto-assign order to nearest driver ───
+@api_router.post("/merchant/orders/{oid}/mark-ready")
+async def mark_order_ready(oid: str, user=Depends(get_current_user)):
+    """Mark order as ready for pickup. Drivers will see it in available orders."""
+    require_merchant(user)
+    o = await db.orders.find_one({"_id": ObjectId(oid)})
+    if not o: raise HTTPException(status_code=404, detail="Not found")
+    await db.orders.update_one({"_id": ObjectId(oid)}, {"$set": {"status": "ready_for_pickup",
+        "marked_ready_at": datetime.now(timezone.utc).isoformat()}})
+    # Try to auto-assign to nearest online driver
+    branch_lat = o.get("branch_lat", 0); branch_lng = o.get("branch_lng", 0)
+    drivers = await db.drivers.find({"online": True}).to_list(100)
+    if drivers and branch_lat:
+        # Find drivers with no active order
+        free_drivers = []
+        for d in drivers:
+            active = await db.orders.count_documents({"driver_id": d.get("user_id"), "status": {"$in": ["assigned", "picked_up"]}})
+            if active < 5:  # allow up to 5 simultaneous
+                d["_dist"] = haversine_km(branch_lat, branch_lng, d.get("current_lat", 0), d.get("current_lng", 0)) if d.get("current_lat") else 999
+                free_drivers.append(d)
+        free_drivers.sort(key=lambda x: x["_dist"])
+        if free_drivers:
+            nearest = free_drivers[0]
+            u = await db.users.find_one({"_id": ObjectId(nearest["user_id"])})
+            if u:
+                await db.orders.update_one({"_id": ObjectId(oid)}, {"$set": {
+                    "driver_id": nearest["user_id"], "driver_name": u.get("name", ""),
+                    "driver_phone": u.get("phone", ""), "status": "assigned",
+                    "auto_assigned_at": datetime.now(timezone.utc).isoformat()}})
+                return {"message": "Order assigned to nearest driver", "driver_name": u.get("name", "")}
+    return {"message": "Order ready, waiting for driver to accept"}
 
 async def seed_data():
     # Categories
